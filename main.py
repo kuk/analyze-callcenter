@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# encoding: utf8
 
 import os.path
 from shutil import rmtree
@@ -301,6 +302,14 @@ def dump_diarization(segments, path):
         pickle.dump([tuple(_) for _ in segments], dump)
 
 
+def load_diarizations(dir='segments', format='{}.pickle', names=NAMES):
+    diarizations = {}
+    for name in names:
+        path = os.path.join(dir, format.format(name))
+        diarizations[name] = load_diarization(path)
+    return diarizations
+
+
 def plot_segment(start, stop, width, speaker, axis,
                  shift=-0.75, color=SILVER):
     if speaker is not None:
@@ -414,15 +423,183 @@ def dump_segments_transcript(transcript, path):
     for segment, part in transcript:
         segment = tuple(segment)
         if part:
-            part = [tuple(_) for _ in part]
+            part = [(_.text.decode('utf8'), _.confidence) for _ in part]
         payload.append((segment, part))
     with open(path, 'w') as dump:
         pickle.dump(payload, dump)
 
 
-def load_transcripts(dir='transcripts', names=NAMES):
+def load_transcripts(dir='transcripts', format='{}.pickle', names=NAMES):
     transcripts = {}
     for name in names:
-        path = os.path.join(dir, name + '.pickle')
+        path = os.path.join(dir, format.format(name))
         transcripts[name] = load_segments_transcript(path)
     return transcripts
+
+
+class Const(namedtuple('Const', 'value')):
+    def dump(self):
+        yield unicode(self.value)
+
+
+def format_attributes(**attributes):
+    return ' '.join('{key}="{value}"'.format(key=key, value=value)
+                    for key, value in attributes.iteritems())
+
+
+def format_style(**style):
+    def format_key(key):
+        return key.replace('_', '-')
+
+    def format_value(value):
+        if isinstance(value, (tuple, list)):
+            return ' '.join(str(_) for _ in value)
+        else:
+            return repr(value)
+
+    return ';'.join(
+        '{key}:{value}'.format(
+            key=format_key(key),
+            value=format_value(value)
+        )
+        for key, value in style.iteritems()
+    )
+
+
+class Tag(object):
+    name = None
+    children = ()
+    attributes = {}
+
+    def __init__(self, *children, **attributes):
+        self.children = [child if isinstance(child, Tag) else Const(child)
+                         for child in children]
+        self.attributes = attributes
+
+    def dump(self):
+        if self.attributes:
+            yield '<{name} {attributes}>'.format(
+                name=self.name,
+                attributes=format_attributes(**self.attributes)
+            )
+        else:
+            yield '<{name}>'.format(name=self.name)
+        yield [_.dump() for _ in self.children]
+        yield '</{name}>'.format(name=self.name)
+
+    def dumps(self, indent=0):
+        def flatten(dump, indent):
+            for item in dump:
+                if isinstance(item, basestring):
+                    yield item
+                else:
+                    for subdump in item:
+                        for line in flatten(subdump, indent):
+                            yield ' ' * indent + line
+
+        lines = flatten(self.dump(), indent)
+        if indent > 0:
+            return '\n'.join(lines)
+        return ''.join(lines)
+
+    def _repr_pretty_(self, printer, cycle):
+        printer.text(self.dumps(indent=2))
+
+    def _repr_html_(self):
+        return self.dumps(indent=0)
+
+
+class table(Tag):
+    name = 'table'
+
+
+class tr(Tag):
+    name = 'tr'
+
+
+class td(Tag):
+    name = 'td'
+
+
+class span(Tag):
+    name = 'span'
+
+
+def join_continuous_words(words):
+    join = []
+    previous = None
+    stride = []
+    for word, correct in words:
+        if previous is None or correct == previous:
+            stride.append(word)
+        else:
+            join.append((' '.join(stride), previous))
+            stride = [word]
+        previous = correct
+    join.append((' '.join(stride), previous))
+    return join
+
+
+def diff_transcripts(guess, etalon):
+    stemmer = SnowballStemmer('russian')
+    normalize = lambda word: stemmer.stem(word.lower())
+    words = set()
+    for option in guess:
+        for word in option.text.split():
+            words.add(normalize(word))
+    text = etalon[0].text
+    misses = []
+    for word in text.split():
+        misses.append((word, (normalize(word) in words)))
+    words = {normalize(_) for _ in text.split()}
+    excesses = []
+    if guess:
+        text = guess[0].text
+        for word in text.split():
+            excesses.append((word, (normalize(word) in words)))
+    return join_continuous_words(excesses), join_continuous_words(misses)
+
+
+def format_diff(diff):
+    format = []
+    for text, correct in diff:
+        if correct:
+            format.append(text)
+        else:
+            format.append(' ')
+            format.append(
+                span(
+                    text,
+                    style=format_style(border_bottom=('1px', 'solid', RED))
+                )
+            )
+            format.append(' ')
+    return format
+
+
+def show_transcripts(guess, etalon):
+    rows = []
+    for (guess_segment, guess_part), (etalon_segment, etalon_part) in zip(guess, etalon):
+        assert guess_segment == etalon_segment
+        guess_diff, etalon_diff = diff_transcripts(guess_part, etalon_part)
+        row = []
+        if guess_part:
+            row.append(
+                td(
+                    u'— ',
+                    *format_diff(guess_diff),
+                    style=format_style(border=0)
+                )
+            )
+        else:
+            row.append(td(style=format_style(border=0)))
+        row.append(
+            td(
+                u'— ',
+                *format_diff(etalon_diff),
+                style=format_style(border=0)
+            )
+        )
+        rows.append(tr(*row, style=format_style(border=0)))
+    html = table(*rows, style='border:0')
+    return html
