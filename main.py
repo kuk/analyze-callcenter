@@ -1,19 +1,23 @@
 #!/usr/bin/env python
 
 import os.path
+from shutil import rmtree
 from math import ceil
-from xml.dom import minidom
+from xml.dom import minidom, getDOMImplementation
 from collections import namedtuple
 from subprocess import check_call
-from tempfile import NamedTemporaryFile
+from tempfile import mkdtemp, NamedTemporaryFile
 import cPickle as pickle
+from collections import Counter
 from functools import partial
 
 import requests
 
 from seaborn import xkcd_rgb as COLORS
 SILVER = COLORS['silver']
+BLUE = COLORS['denim blue']
 GREEN = COLORS['medium green']
+RED = COLORS['reddish orange']
 
 from matplotlib import pyplot as plt
 
@@ -22,6 +26,11 @@ from scipy.signal import decimate
 # sudo apt-get install libsndfile-dev libasound2-dev 
 # pip install scikits.audiolab
 import scikits.audiolab as audio 
+
+from nltk.stem import SnowballStemmer
+
+
+NAMES = ['mosenergo', 'rigla', 'transaero', 'water', 'worldclass']
 
 
 class Sound(object):
@@ -74,7 +83,7 @@ class Option(namedtuple('Transcript', ['text', 'confidence'])):
         printer.end_group(7, ')')
 
 
-def read_sounds(dir='sounds', names=['mosenergo', 'rigla', 'transaero', 'water', 'worldclass', 'test']):
+def read_sounds(dir='sounds', names=NAMES):
     sounds = {}
     for name in names:
         path = os.path.join(dir, name + '.wav')
@@ -135,16 +144,152 @@ def read_diarization(path):
         yield Segment(start, stop, speaker, gender)
 
 
-def diarize_sound(sound, lium='lium_spkdiarization-8.4.1.jar'):
-    with NamedTemporaryFile(suffix='.wav') as tmp:
-        write_sound(sound, tmp.name)
-        with NamedTemporaryFile(suffix='.xml') as dump:
-            check_call(['java', '-jar', lium, '--fInputMask', tmp.name,
-                        '--sOutputFormat', 'seg.xml,UTF8',
-                        '--sOutputMask', dump.name,
-                        '--doCEClustering', 'sound'])
-            return list(read_diarization(dump.name))
+def write_diarization(segments, path):
+    impl = getDOMImplementation()
+    epac = impl.createDocument(None, 'epac', None)
+    audio = epac.documentElement.appendChild(epac.createElement('audiofile'))
+    audio.setAttribute('name', 'sound')
+    node = audio.appendChild(epac.createElement('speakers'))
+    speakers = {(_.speaker, _.gender) for _ in segments}
+    for name, gender in speakers:
+        node = node.appendChild(epac.createElement('speaker'))
+        node.setAttribute('name', name)
+        node.setAttribute('gender', gender)
+        node.setAttribute('generator', 'auto')
+        node.setAttribute('identity', '')
+        node.setAttribute('type', 'generic label')
+    node = audio.appendChild(epac.createElement('segments'))
+    for segment in segments:
+        node = node.appendChild(epac.createElement('segment'))
+        node.setAttribute('start', str(segment.start))
+        node.setAttribute('end', str(segment.stop))
+        node.setAttribute('speaker', segment.speaker)
+        node.setAttribute('generator', 'auto')
+        node.setAttribute('bandwidth', 'U')
+    with open(path, 'w') as dump:
+        dump.write(epac.toxml())
 
+
+def diarize_sound(sound, lium='lium'):
+    # Since LIUM was trained with 16khz data
+    decimate = sound.decimate(16000)
+    with NamedTemporaryFile(suffix='.wav') as file:
+        path = file.name
+        write_sound(decimate, path)
+        data = mkdtemp()
+        try:
+            check_call(['./diarization.sh', path, data], cwd=lium)
+            path = os.path.join(data, 'segments.seg')
+            segments = read_diarization(path)
+            segments = remove_silent_segment(segments, sound)
+            segments = rename_segments(segments)
+            segments = join_continuous_segments(segments)
+            return segments
+        finally:
+            rmtree(data)
+
+
+def remove_silent_segment(segments, sound):
+    clean = []
+    for segment in segments:
+        slice = sound[segment.start:segment.stop]
+        energy = (slice.signal ** 2).sum()
+        density = energy / slice.seconds
+        if density > 15:
+            clean.append(segment)
+    return clean
+
+
+def rename_segments(segments):
+    seconds = Counter()
+    for segment in segments:
+        seconds[segment.speaker] += (segment.stop - segment.start)
+    mapping = {}
+    top = [speaker for speaker, _ in seconds.most_common()]
+    mapping[top[0]] = 'S0'
+    for speaker in top[1:]:
+        mapping[speaker] = 'S1'
+    return [Segment(_.start, _.stop, mapping[_.speaker], _.gender) for _ in segments]
+
+
+def join_continuous_segments(segments):
+    join = []
+    previous = None
+    for segment in segments:
+        if not previous:
+            previous = segment
+        elif previous.speaker == segment.speaker and previous.stop == segment.start:
+            previous = Segment(
+                previous.start, segment.stop,
+                previous.speaker, previous.gender
+            )
+        else:
+            join.append(previous)
+            previous = segment
+    join.append(previous)
+    return join
+
+
+def diff_segments(guess, etalon):
+    etalon_start = 0
+    etalon_stop = 1
+    guess_start = 2
+    guess_stop = 3
+    points = []
+    for index, segment in enumerate(etalon):
+        points.append((segment.start, index, etalon_start, segment.speaker))
+        points.append((segment.stop, index, etalon_stop, None))
+    for index, segment in enumerate(guess):
+        points.append((segment.start, index, guess_start, segment.speaker))
+        points.append((segment.stop, index, guess_stop, None))
+    points = sorted(points)
+    diff = []
+    no_etalon_no_guess = 0
+    no_etalon_guess = 1
+    etalon_no_guess = 2
+    etalon_guess = 3
+    state = no_etalon_no_guess
+    previous = 0
+    etalon_speaker = None
+    guess_speaker = None
+    for point, _, type, speaker in points:
+        if previous != point:
+            diff.append((previous, point, state, etalon_speaker, guess_speaker))
+        previous = point
+        if state == no_etalon_no_guess:
+            if type == etalon_start:
+                state = etalon_no_guess
+                etalon_speaker = speaker
+            elif type == guess_start:
+                state = no_etalon_guess
+                guess_speaker = speaker
+        elif state == no_etalon_guess:
+            if type == etalon_start:
+                state = etalon_guess
+                etalon_speaker = speaker
+            elif type == guess_stop:
+                state = no_etalon_no_guess
+                guess_speaker = None
+        elif state == etalon_no_guess:
+            if type == etalon_stop:
+                state = no_etalon_no_guess
+                etalon_speaker = None
+            elif type == guess_start:
+                state = etalon_guess
+                guess_speaker = speaker
+        elif state == etalon_guess:
+            if type == etalon_stop:
+                state = no_etalon_guess
+                etalon_speaker = None
+            elif type == guess_stop:
+                state = etalon_no_guess
+                guess_speaker = None
+    diff = [Segment(start, stop, None, None)
+            for start, stop, state, etalon_speaker, guess_speaker in diff
+            if (state == etalon_no_guess
+                or (state == etalon_guess and etalon_speaker != guess_speaker))]
+    return join_continuous_segments(diff)
+            
 
 def load_diarization(path):
     with open(path) as dump:
@@ -158,7 +303,7 @@ def dump_diarization(segments, path):
 
 def plot_segment(start, stop, width, speaker, axis,
                  shift=-0.75, color=SILVER):
-    if speaker:
+    if speaker is not None:
         axis.text(start, shift - 0.1, speaker)
     axis.axhline(
         shift, start / width + 0.01, stop / width,
@@ -166,16 +311,19 @@ def plot_segment(start, stop, width, speaker, axis,
     )
 
 
-def plot_segments(sound, guess, etalon, sample=10, linewidth=0.1, height=1.5, step=20):
+def plot_segments(sound, guess=(), etalon=(), diff=True, sample=10, linewidth=0.1, height=1.5, step=20):
     axes = plot_sound(
         sound, sample=sample, linewidth=linewidth,
         height=height, step=step
     )
     rate = sound.rate / sample
     width = step * rate
+    if diff:
+        diff = diff_segments(guess, etalon)
     for segments, plot in [
-        (guess, partial(plot_segment, shift=-0.75, color=SILVER)),
-        (etalon, partial(plot_segment, shift=-0.5, color=GREEN))
+        (guess, partial(plot_segment, shift=-0.45, color=BLUE)),
+        (etalon, partial(plot_segment, shift=-0.7, color=GREEN)),
+        (diff, partial(plot_segment, shift=-0.95, color=RED))
     ]:
         for segment in segments:
             speaker = segment.speaker
@@ -237,6 +385,12 @@ def transcribe_sound(sound):
 def transcribe_segments(sound, segments):
     for segment in segments:
         slice = sound[segment.start:segment.stop]
+        # 48khz (default) sound accupies 0.1Mb/s so 10 seconds piece
+        # as larger that 1Mb so I resample it to 22khz. It accupies
+        # 0.05Mb/s so 20 seconds is more that 1Mb but lickely there
+        # were no such segments
+        if slice.seconds > 10:
+            slice = slice.decimate(22000)
         try:
             transcript = transcribe_sound(slice)
         except:
@@ -264,3 +418,11 @@ def dump_segments_transcript(transcript, path):
         payload.append((segment, part))
     with open(path, 'w') as dump:
         pickle.dump(payload, dump)
+
+
+def load_transcripts(dir='transcripts', names=NAMES):
+    transcripts = {}
+    for name in names:
+        path = os.path.join(dir, name + '.pickle')
+        transcripts[name] = load_segments_transcript(path)
+    return transcripts
