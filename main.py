@@ -603,3 +603,26 @@ def show_transcripts(guess, etalon):
         rows.append(tr(*row, style=format_style(border=0)))
     html = table(*rows, style='border:0')
     return html
+
+
+def transcript_errors(guess, etalon):
+    guess_errors = 0
+    guess_total = 0
+    etalon_errors = 0
+    etalon_total = 0
+    for (guess_segment, guess_part), (etalon_segment, etalon_part) in zip(guess, etalon):
+        assert guess_segment == etalon_segment
+        guess_diff, etalon_diff = diff_transcripts(guess_part, etalon_part)
+        for words, correct in guess_diff:
+            words = len(words.split())
+            if not correct:
+                guess_errors += words
+            guess_total += words
+        for words, correct in etalon_diff:
+            words = len(words.split())
+            if not correct:
+                etalon_errors += words
+            etalon_total += words
+    guess_errors = float(guess_errors) / guess_total
+    etalon_errors = float(etalon_errors) / etalon_total
+    return guess_errors, etalon_errors
