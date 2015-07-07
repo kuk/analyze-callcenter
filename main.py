@@ -396,10 +396,12 @@ def transcribe_segments(sound, segments):
         slice = sound[segment.start:segment.stop]
         # 48khz (default) sound accupies 0.1Mb/s so 10 seconds piece
         # as larger that 1Mb so I resample it to 22khz. It accupies
-        # 0.05Mb/s so 20 seconds is more that 1Mb but lickely there
-        # were no such segments
+        # 0.05Mb/s so 20 seconds is more that 1Mb so I resample
+        # segments larger then that to 8khz and hope they fit
         if slice.seconds > 10:
             slice = slice.decimate(22000)
+        elif slice.seconds > 20:
+            slice = slice.decimate(8000)
         try:
             transcript = transcribe_sound(slice)
         except:
@@ -544,11 +546,12 @@ def diff_transcripts(guess, etalon):
     stemmer = SnowballStemmer('russian')
     normalize = lambda word: stemmer.stem(word.lower())
     words = set()
-    for option in guess:
-        for word in option.text.split():
-            words.add(normalize(word))
-    text = etalon[0].text
+    if guess:
+        for option in guess:
+            for word in option.text.split():
+                words.add(normalize(word))
     misses = []
+    text = etalon[0].text
     for word in text.split():
         misses.append((word, (normalize(word) in words)))
     words = {normalize(_) for _ in text.split()}
