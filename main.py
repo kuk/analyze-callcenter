@@ -17,6 +17,7 @@ import requests
 from seaborn import xkcd_rgb as COLORS
 SILVER = COLORS['silver']
 BLUE = COLORS['denim blue']
+YELLOW = COLORS['cream']
 GREEN = COLORS['medium green']
 RED = COLORS['reddish orange']
 
@@ -457,7 +458,7 @@ def format_style(**style):
         if isinstance(value, (tuple, list)):
             return ' '.join(str(_) for _ in value)
         else:
-            return repr(value)
+            return str(value)
 
     return ';'.join(
         '{key}:{value}'.format(
@@ -528,56 +529,52 @@ class span(Tag):
 
 
 def join_continuous_words(words):
-    join = []
     previous = None
     stride = []
     for word, correct in words:
         if previous is None or correct == previous:
             stride.append(word)
         else:
-            join.append((' '.join(stride), previous))
+            yield ' '.join(stride), previous
             stride = [word]
         previous = correct
-    join.append((' '.join(stride), previous))
-    return join
+    yield ' '.join(stride), previous
+
+
+def normalize_word(word, stemmer=SnowballStemmer('russian')):
+    return stemmer.stem(word.lower())
 
 
 def diff_transcripts(guess, etalon):
-    stemmer = SnowballStemmer('russian')
-    normalize = lambda word: stemmer.stem(word.lower())
     words = set()
     if guess:
         for option in guess:
             for word in option.text.split():
-                words.add(normalize(word))
+                words.add(normalize_word(word))
     misses = []
     text = etalon[0].text
     for word in text.split():
-        misses.append((word, (normalize(word) in words)))
-    words = {normalize(_) for _ in text.split()}
+        misses.append((word, (normalize_word(word) in words)))
+    words = {normalize_word(_) for _ in text.split()}
     excesses = []
     if guess:
         text = guess[0].text
         for word in text.split():
-            excesses.append((word, (normalize(word) in words)))
+            excesses.append((word, (normalize_word(word) in words)))
     return join_continuous_words(excesses), join_continuous_words(misses)
 
 
 def format_diff(diff):
-    format = []
     for text, correct in diff:
         if correct:
-            format.append(text)
+            yield text
         else:
-            format.append(' ')
-            format.append(
-                span(
-                    text,
-                    style=format_style(border_bottom=('1px', 'solid', RED))
-                )
+            yield ' '
+            yield span(
+                text,
+                style=format_style(border_bottom=('1px', 'solid', RED))
             )
-            format.append(' ')
-    return format
+            yield ' '
 
 
 def show_transcripts(guess, etalon):
@@ -629,3 +626,80 @@ def transcript_errors(guess, etalon):
     guess_errors = float(guess_errors) / guess_total
     etalon_errors = float(etalon_errors) / etalon_total
     return guess_errors, etalon_errors
+
+
+def match_text(text, query):
+    keywords = query.split()
+    keywords = {normalize_word(_) for _ in keywords}
+    matches = []
+    positions = []
+    words = text.split()
+    for index, word in enumerate(words):
+        word = normalize_word(word)
+        if word in keywords:
+            matches.append(word)
+            positions.append(index)
+    density = 0
+    if positions:
+        density = min(positions) - max(positions)
+    relevance = (len(set(matches)), len(matches), density)
+    return relevance, positions
+
+
+def query_transcripts(query, transcripts, top=1):
+    results = []
+    for name, transcript in transcripts.iteritems():
+        for segment, options in transcript:
+            if options:
+                group = []
+                for option in options:
+                    text = option.text
+                    relevance, positions = match_text(text, query)
+                    group.append((relevance, name, segment, text, positions))
+                results.append(max(group))
+    results = sorted(results, reverse=True)
+    return results[:top]
+
+
+def format_query_results(text, positions):
+    positions = set(positions)
+    words = text.split()
+    matches = []
+    for index, word in enumerate(words):
+        matches.append((word, (index in positions)))
+    matches = join_continuous_words(matches)
+    for text, match in matches:
+        if match:
+            yield ' '
+            yield span(
+                text,
+                style=format_style(
+                    background_color=YELLOW,
+                )
+            )
+            yield ' '
+        else:
+            yield text
+
+
+def show_query_results(results):
+    rows = []
+    for relevance, name, segment, text, positions in results:
+        rows.append(
+            tr(
+                td(name, style=format_style(border=0)),
+                td(
+                    '{0.start}..{0.stop}'.format(segment),
+                    style=format_style(border=0)
+                ),
+                td(
+                    u'— ',
+                    *format_query_results(text, positions),
+                    style=format_style(border=0)
+                ),
+                style=format_style(border=0)
+            )
+        )
+    html = table(*rows, style='border:0')
+    return html
+        
