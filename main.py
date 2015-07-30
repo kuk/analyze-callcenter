@@ -13,6 +13,9 @@ from collections import Counter
 from functools import partial
 
 import requests
+requests.packages.urllib3.disable_warnings()
+
+import pandas as pd
 
 from seaborn import xkcd_rgb as COLORS
 SILVER = COLORS['silver']
@@ -33,6 +36,7 @@ from nltk.stem import SnowballStemmer
 
 
 NAMES = ['mosenergo', 'rigla', 'transaero', 'water', 'worldclass']
+C3_NAMES = ['alexander', 'for_free', 'pavel', 'vladimir', 'vladislav']
 
 
 class Sound(object):
@@ -330,6 +334,8 @@ def plot_segments(sound, guess=(), etalon=(), diff=True, sample=10, linewidth=0.
     width = step * rate
     if diff:
         diff = diff_segments(guess, etalon)
+    else:
+        diff = ()
     for segments, plot in [
         (guess, partial(plot_segment, shift=-0.45, color=BLUE)),
         (etalon, partial(plot_segment, shift=-0.7, color=GREEN)),
@@ -399,9 +405,11 @@ def transcribe_segments(sound, segments):
         # as larger that 1Mb so I resample it to 22khz. It accupies
         # 0.05Mb/s so 20 seconds is more that 1Mb so I resample
         # segments larger then that to 8khz and hope they fit
-        if slice.seconds > 10:
+        seconds = slice.seconds
+        rate = slice.rate
+        if seconds > 10 and rate > 22000:
             slice = slice.decimate(22000)
-        elif slice.seconds > 20:
+        elif seconds > 20 and rate > 8000:
             slice = slice.decimate(8000)
         try:
             transcript = transcribe_sound(slice)
@@ -426,7 +434,8 @@ def dump_segments_transcript(transcript, path):
     for segment, part in transcript:
         segment = tuple(segment)
         if part:
-            part = [(_.text.decode('utf8'), _.confidence) for _ in part]
+            part = [tuple(_) for _ in part]
+            # part = [(_.text.decode('utf8'), _.confidence) for _ in part]
         payload.append((segment, part))
     with open(path, 'w') as dump:
         pickle.dump(payload, dump)
@@ -528,6 +537,10 @@ class span(Tag):
     name = 'span'
 
 
+class font(Tag):
+    name = 'font'
+
+
 def join_continuous_words(words):
     previous = None
     stride = []
@@ -564,16 +577,19 @@ def diff_transcripts(guess, etalon):
     return join_continuous_words(excesses), join_continuous_words(misses)
 
 
-def format_diff(diff):
+def format_diff(diff, simple=True):
     for text, correct in diff:
         if correct:
             yield text
         else:
             yield ' '
-            yield span(
-                text,
-                style=format_style(border_bottom=('1px', 'solid', RED))
-            )
+            if simple:
+                yield font(text, color=RED)
+            else:
+                yield span(
+                    text,
+                    style=format_style(border_bottom=('1px', 'solid', RED))
+                )
             yield ' '
 
 
@@ -703,3 +719,17 @@ def show_query_results(results):
     html = table(*rows, style='border:0')
     return html
         
+
+def read_mp3_sound(path):
+    with NamedTemporaryFile(suffix='.wav') as tmp:
+        wav = tmp.name
+        check_call(['ffmpeg', '-y', '-i', path, '-ar', '16000', wav])
+        return read_sound(wav)
+
+
+def read_c3_sounds(dir='sounds/c3', names=C3_NAMES):
+    sounds = {}
+    for name in names:
+        path = os.path.join(dir, name + '.mp3')
+        sounds[name] = read_mp3_sound(path)
+    return sounds
